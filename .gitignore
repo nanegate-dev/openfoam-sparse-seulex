@@ -1,0 +1,18 @@
+# Build artifacts
+platforms/
+linux64Gcc*/
+*.o
+*.so
+*.dep
+.wmake*
+wmake.log
+
+# Temporary test directories
+/tmp/
+__pycache__/
+*.pyc
+
+# Case outputs
+postProcessing/
+log.*
+chemFoam.out

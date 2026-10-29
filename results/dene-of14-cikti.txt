@@ -1,0 +1,19 @@
+Mon Oct 26 17:25:26 +03 2026
+derleme: /root/paket_test14/kod/seulexFast-of14
+h2 seulex: 0.018384 s 
+h2 seulexFast: 0.0184 s 
+   ayni 71 adim; en buyuk sicaklik farki 0.000e+00 K
+   tutusma ani (1500 K) 2.2130282e-04 / 2.2130282e-04 s; son sicaklik 2220.4600 / 2220.4600 K
+gri seulex: 0.708019 s 
+gri seulexFast: 0.542716 s 
+   ayni 765 adim; en buyuk sicaklik farki 0.000e+00 K
+   tutusma ani (1500 K) 5.9419384e-02 / 5.9419384e-02 s; son sicaklik 2660.5700 / 2660.5700 K
+nc7h16 seulex: 23.3707 s 
+nc7h16 seulexFast: 3.49042 s 
+   adim dizisi tutusmada ayristi (119 / 119 adim)
+   tutusma ani (1500 K) 6.0039786e-04 / 6.0039786e-04 s; son sicaklik 2649.6100 / 2649.6100 K
+ic8h18 seulex: 559.832 s 
+ic8h18 seulexFast: 27.2083 s 
+   ayni 1030 adim; en buyuk sicaklik farki 2.000e-02 K
+   tutusma ani (1500 K) 5.4796832e-03 / 5.4796832e-03 s; son sicaklik 2660.0000 / 2660.0000 K
+Mon Oct 26 17:35:52 +03 2026

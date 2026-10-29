@@ -1,0 +1,1105 @@
+From 79b65bdb9b15c07ee5de7c25846ccb740b008e38 Mon Sep 17 00:00:00 2001
+From: nanegate <67761222+nanegate@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 03:13:12 +0300
+Subject: [PATCH] ENH: ODE: add sparse LU and autonomous derivative reuse to
+ seulex
+
+- factorise (1/dx)I - J with a minimum-degree symbolic/numeric sparse
+  LU solver (seulexSparseLU) when the symbolic factorisation requires
+  fewer than half the multiply-adds of dense LU
+- skip leading zero blocks during sparse forward substitution and fall
+  back to dense LU with partial pivoting on small pivots
+- absorb new non-zero Jacobian entries that land in existing fill-in
+  positions without rebuilding the symbolic factorisation
+- add optional autonomous switch (default: false) to share the initial
+  step derivative f(y0) across extrapolation columns and reuse the
+  divergence-test derivative evaluation on the subsequent substep
+- add optional sparse switch (default: true) and register seulexFast
+  as a runtime selection alias for backward compatibility
+---
+ src/ODE/Make/files                          |   1 +
+ src/ODE/ODESolvers/seulex/seulex.C          | 202 +++++++++++-
+ src/ODE/ODESolvers/seulex/seulex.H          |  55 +++-
+ src/ODE/ODESolvers/seulex/seulexSparseLU.C  | 336 ++++++++++++++++++++
+ src/ODE/ODESolvers/seulex/seulexSparseLU.H  | 171 ++++++++++
+ src/ODE/ODESolvers/seulex/seulexSparseLUI.H | 136 ++++++++
+ 6 files changed, 885 insertions(+), 16 deletions(-)
+ create mode 100644 src/ODE/ODESolvers/seulex/seulexSparseLU.C
+ create mode 100644 src/ODE/ODESolvers/seulex/seulexSparseLU.H
+ create mode 100644 src/ODE/ODESolvers/seulex/seulexSparseLUI.H
+
+diff --git a/src/ODE/Make/files b/src/ODE/Make/files
+index 912b36f..be6a8a0 100644
+--- a/src/ODE/Make/files
++++ b/src/ODE/Make/files
+@@ -16,6 +16,7 @@ ODESolvers/rodas34/rodas34.C
+ ODESolvers/SIBS/SIBS.C
+ ODESolvers/SIBS/SIMPR.C
+ ODESolvers/SIBS/polyExtrapolate.C
++ODESolvers/seulex/seulexSparseLU.C
+ ODESolvers/seulex/seulex.C
+ 
+ LIB = $(FOAM_LIBBIN)/libODE
+diff --git a/src/ODE/ODESolvers/seulex/seulex.C b/src/ODE/ODESolvers/seulex/seulex.C
+index 093f396..02b109f 100644
+--- a/src/ODE/ODESolvers/seulex/seulex.C
++++ b/src/ODE/ODESolvers/seulex/seulex.C
+@@ -7,6 +7,7 @@
+ -------------------------------------------------------------------------------
+     Copyright (C) 2013-2016 OpenFOAM Foundation
+     Copyright (C) 2019 OpenCFD Ltd.
++    Copyright (C) 2026 OpenFOAM Contributors
+ -------------------------------------------------------------------------------
+ License
+     This file is part of OpenFOAM.
+@@ -36,6 +37,7 @@ namespace Foam
+     defineTypeNameAndDebug(seulex, 0);
+ 
+     addToRunTimeSelectionTable(ODESolver, seulex, dictionary);
++    addNamedToRunTimeSelectionTable(ODESolver, seulex, dictionary, seulexFast);
+ 
+     const scalar
+         seulex::stepFactor1_ = 0.6,
+@@ -53,6 +55,8 @@ namespace Foam
+ Foam::seulex::seulex(const ODESystem& ode, const dictionary& dict)
+ :
+     ODESolver(ode, dict),
++    useSparse_(dict.getOrDefault<Switch>("sparse", true)),
++    autonomous_(dict.getOrDefault<Switch>("autonomous", false)),
+     jacRedo_(min(1e-4, min(relTol_))),
+     nSeq_(iMaxx_),
+     cpu_(iMaxx_),
+@@ -70,7 +74,11 @@ Foam::seulex::seulex(const ODESystem& ode, const dictionary& dict)
+     scale_(n_),
+     dy_(n_),
+     yTemp_(n_),
+-    dydx_(n_)
++    dydx_(n_),
++    f0_(n_),
++    sparse_(false),
++    denseNow_(true),
++    nBuild_(0)
+ {
+     // The CPU time factors for the major parts of the algorithm
+     const scalar cpuFunc = 1, cpuJac = 5, cpuLU = 1, cpuSolve = 1;
+@@ -103,6 +111,145 @@ Foam::seulex::seulex(const ODESystem& ode, const dictionary& dict)
+ 
+ // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+ 
++void Foam::seulex::updatePattern
++(
++    const scalar x,
++    const scalarField& y
++) const
++{
++    const label n = n_;
++
++    if (!useSparse_ || nBuild_ > 10 || (!sparse_ && pattern_.size() == n*n))
++    {
++        sparse_ = false;
++        return;
++    }
++
++    bool grown = false;
++
++    if (pattern_.size() != n*n)
++    {
++        if (nBuild_ >= 10)
++        {
++            ++nBuild_;
++            sparse_ = false;
++            return;
++        }
++
++        pattern_.resize(n*n);
++        pattern_ = false;
++        for (label i = 0; i < n; ++i)
++        {
++            pattern_[i*n + i] = true;
++        }
++
++        // Entries that vanish only at this state (zero concentrations):
++        // the Jacobian at a state with every component shifted up
++        scalarField yProbe(y);
++        forAll(yProbe, i)
++        {
++            const scalar yi = y[i];
++            yProbe[i] =
++                yi >= -1e-6
++              ? mag(yi) + 1e-6*(1 + mag(yi))
++              : yi - 1e-6*(1 + mag(yi));
++        }
++        scalarField dfdxProbe(n);
++        scalarSquareMatrix dfdyProbe(n);
++        odes_.jacobian(x, yProbe, dfdxProbe, dfdyProbe);
++        const scalar* p = dfdyProbe.cdata();
++        forAll(pattern_, q)
++        {
++            if (p[q] != 0)
++            {
++                pattern_[q] = true;
++            }
++        }
++        grown = true;
++    }
++
++    // New non-zeros: taken into the current factors where those already
++    // store the position (fill-in), otherwise the pattern is rebuilt
++    const scalar* J = dfdy_.cdata();
++    label nTaken = 0;
++    forAll(pattern_, q)
++    {
++        if (J[q] != 0 && !pattern_[q])
++        {
++            pattern_[q] = true;
++            if (!grown && slu_.addEntry(q))
++            {
++                ++nTaken;
++            }
++            else
++            {
++                grown = true;
++            }
++        }
++    }
++
++    if (debug && nTaken && !grown)
++    {
++        Info<< type() << ": " << nTaken
++            << " new entries taken into the fill-in" << endl;
++    }
++
++    if (grown)
++    {
++        if (++nBuild_ > 10)
++        {
++            sparse_ = false;
++            return;
++        }
++
++        slu_.build(n, pattern_);
++        sparse_ = slu_.nUpdates() < 0.5*scalar(n)*n*n/3;
++
++        if (debug)
++        {
++            Info<< type() << ": pattern built (" << nBuild_ << "), n " << n
++                << ", sparse factorisation " << slu_.nUpdates()
++                << " multiply-adds against " << scalar(n)*n*n/3
++                << " dense, using " << (sparse_ ? "sparse" : "dense") << endl;
++        }
++    }
++}
++
++
++void Foam::seulex::factorise(const scalar dx) const
++{
++    denseNow_ = !(sparse_ && slu_.factor(dfdy_, 1/dx));
++
++    if (denseNow_)
++    {
++        for (label i=0; i<n_; i++)
++        {
++            for (label j=0; j<n_; j++)
++            {
++                a_(i, j) = -dfdy_(i, j);
++            }
++
++            a_(i, i) += 1/dx;
++        }
++
++        LUDecompose(a_, pivotIndices_);
++    }
++}
++
++
++void Foam::seulex::linSolve(scalarField& b) const
++{
++    if (denseNow_)
++    {
++        LUBacksubstitute(a_, pivotIndices_, b);
++    }
++    else
++    {
++        slu_.solve(b);
++    }
++}
++
++
+ bool Foam::seulex::seul
+ (
+     const scalar x0,
+@@ -116,24 +263,32 @@ bool Foam::seulex::seul
+     label nSteps = nSeq_[k];
+     scalar dx = dxTot/nSteps;
+ 
+-    for (label i=0; i<n_; i++)
++    factorise(dx);
++
++    scalar xnew = x0 + dx;
++
++    if (autonomous_)
+     {
+-        for (label j=0; j<n_; j++)
++        // The derivatives do not depend on the time argument, so every
++        // column's first right-hand side f(x0 + dx_k, y0) is the same
++        // vector: evaluated with the first column of each step attempt
++        if (k == 0)
+         {
+-            a_(i, j) = -dfdy_(i, j);
++            odes_.derivatives(xnew, y0, f0_);
+         }
+-
+-        a_(i, i) += 1/dx;
++        dy_ = f0_;
+     }
+-
+-    LUDecompose(a_, pivotIndices_);
+-
+-    scalar xnew = x0 + dx;
+-    odes_.derivatives(xnew, y0, dy_);
+-    LUBacksubstitute(a_, pivotIndices_, dy_);
++    else
++    {
++        odes_.derivatives(xnew, y0, dy_);
++    }
++    linSolve(dy_);
+ 
+     yTemp_ = y0;
+ 
++    // dydx_ holds f(yTemp_) after the divergence test (autonomous systems)
++    bool haveF = false;
++
+     for (label nn=1; nn<nSteps; nn++)
+     {
+         yTemp_ += dy_;
+@@ -149,12 +304,13 @@ bool Foam::seulex::seul
+             dy1 = sqrt(dy1);
+ 
+             odes_.derivatives(x0 + dx, yTemp_, dydx_);
++            haveF = autonomous_;
+             for (label i=0; i<n_; i++)
+             {
+                 dy_[i] = dydx_[i] - dy_[i]/dx;
+             }
+ 
+-            LUBacksubstitute(a_, pivotIndices_, dy_);
++            linSolve(dy_);
+ 
+             const scalar denom = min(1, dy1 + SMALL);
+             scalar dy2 = 0;
+@@ -178,8 +334,17 @@ bool Foam::seulex::seul
+             }
+         }
+ 
+-        odes_.derivatives(xnew, yTemp_, dy_);
+-        LUBacksubstitute(a_, pivotIndices_, dy_);
++        if (haveF)
++        {
++            // The divergence test has just evaluated f at this same state
++            dy_ = dydx_;
++            haveF = false;
++        }
++        else
++        {
++            odes_.derivatives(xnew, yTemp_, dy_);
++        }
++        linSolve(dy_);
+     }
+ 
+     for (label i=0; i<n_; i++)
+@@ -229,6 +394,11 @@ bool Foam::seulex::resize()
+         resizeField(dy_);
+         resizeField(yTemp_);
+         resizeField(dydx_);
++        resizeField(f0_);
++
++        pattern_.clear();
++        sparse_ = false;
++        denseNow_ = true;
+ 
+         return true;
+     }
+@@ -271,6 +441,7 @@ void Foam::seulex::solve
+     if (theta_ > jacRedo_)
+     {
+         odes_.jacobian(x, y, dfdx_, dfdy_);
++        updatePattern(x, y);
+         jacUpdated = true;
+     }
+ 
+@@ -423,6 +594,7 @@ void Foam::seulex::solve
+                 if (theta_ > jacRedo_ && !jacUpdated)
+                 {
+                     odes_.jacobian(x, y, dfdx_, dfdy_);
++                    updatePattern(x, y);
+                     jacUpdated = true;
+                 }
+             }
+diff --git a/src/ODE/ODESolvers/seulex/seulex.H b/src/ODE/ODESolvers/seulex/seulex.H
+index d12473e..e6e5dbd 100644
+--- a/src/ODE/ODESolvers/seulex/seulex.H
++++ b/src/ODE/ODESolvers/seulex/seulex.H
+@@ -7,6 +7,7 @@
+ -------------------------------------------------------------------------------
+     Copyright (C) 2013-2016 OpenFOAM Foundation
+     Copyright (C) 2019 OpenCFD Ltd.
++    Copyright (C) 2026 OpenFOAM Contributors
+ -------------------------------------------------------------------------------
+ License
+     This file is part of OpenFOAM.
+@@ -34,6 +35,18 @@ Description
+     An extrapolation-algorithm, based on the linearly implicit Euler method
+     with step size control and order selection.
+ 
++    With the optional switch \c sparse (on by default), the linear systems
++    \c (1/dx)I-J are factorised by a sparse LU on the sparsity pattern of
++    the Jacobian (seulexSparseLU) whenever the symbolic factorisation needs
++    fewer than half the multiply-adds of the dense LU, falling back to the
++    dense LU with partial pivoting if a pivot is too small.
++
++    With the optional switch \c autonomous (off by default), for ODE systems
++    whose derivatives do not depend on the time argument (such as chemistry),
++    the initial right-hand side \c f(y0) of a step is evaluated once and
++    shared across extrapolation columns, and the right-hand side evaluated by
++    the divergence test is reused for the next substep.
++
+     Reference:
+     \verbatim
+         Hairer, E., Nørsett, S. P., & Wanner, G. (1996).
+@@ -53,6 +66,8 @@ SourceFiles
+ #include "ODESolver.H"
+ #include "scalarMatrices.H"
+ #include "labelField.H"
++#include "boolList.H"
++#include "seulexSparseLU.H"
+ 
+ // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+ 
+@@ -79,6 +94,13 @@ class seulex
+                 stepFactor4_, stepFactor5_,
+                 kFactor1_, kFactor2_;
+ 
++        //- Allow sparse LU factorisation when the pattern is sparse (default: true)
++        const bool useSparse_;
++
++        //- The derivatives do not depend on the time argument: right-hand
++        //  sides at the same state are shared (switch autonomous, default: false)
++        const bool autonomous_;
++
+         // Evaluated constants
+ 
+             scalar jacRedo_;
+@@ -106,9 +128,40 @@ class seulex
+             // Fields used in "seul" function
+             mutable scalarField dy_, yTemp_, dydx_;
+ 
++            //- f(y0) of the current step attempt (autonomous systems)
++            mutable scalarField f0_;
++
++        // Sparse linear algebra
++
++            //- Possible non-zeros of the Jacobian, n x n row-major
++            mutable boolList pattern_;
++
++            //- Ordering and symbolic factorisation for pattern_
++            mutable seulexSparseLU slu_;
++
++            //- The sparse factorisation is cheaper for this pattern
++            mutable bool sparse_;
++
++            //- The current factorisation is the dense one
++            mutable bool denseNow_;
++
++            //- Pattern rebuilds; past a limit (the system keeps changing
++            //  size, as with TDAC) the solver stays dense
++            mutable label nBuild_;
++
+ 
+     // Private Member Functions
+ 
++        //- Add the Jacobian's non-zeros to the pattern; rebuild the
++        //  symbolic factorisation when it grew
++        void updatePattern(const scalar x, const scalarField& y) const;
++
++        //- Factorise (1/dx) I - J
++        void factorise(const scalar dx) const;
++
++        //- Solve with the current factorisation
++        void linSolve(scalarField& b) const;
++
+         //- Computes the j-th line of the extrapolation table
+         bool seul
+         (
+@@ -120,7 +173,7 @@ class seulex
+             const scalarField& scale
+         ) const;
+ 
+-        //- Polynomial extrpolation
++        //- Polynomial extrapolation
+         void extrapolate
+         (
+             const label k,
+diff --git a/src/ODE/ODESolvers/seulex/seulexSparseLU.C b/src/ODE/ODESolvers/seulex/seulexSparseLU.C
+new file mode 100644
+index 0000000..c798ca7
+--- /dev/null
++++ b/src/ODE/ODESolvers/seulex/seulexSparseLU.C
+@@ -0,0 +1,336 @@
++/*---------------------------------------------------------------------------*\
++  =========                 |
++  \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox
++   \\    /   O peration     |
++    \\  /    A nd           | www.openfoam.com
++     \\/     M anipulation  |
++-------------------------------------------------------------------------------
++    Copyright (C) 2026 OpenFOAM Contributors
++-------------------------------------------------------------------------------
++License
++    This file is part of OpenFOAM.
++
++    OpenFOAM is free software: you can redistribute it and/or modify it
++    under the terms of the GNU General Public License as published by
++    the Free Software Foundation, either version 3 of the License, or
++    (at your option) any later version.
++
++    OpenFOAM is distributed in the hope that it will be useful, but WITHOUT
++    ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++    FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++    for more details.
++
++    You should have received a copy of the GNU General Public License
++    along with OpenFOAM.  If not, see <http://www.gnu.org/licenses/>.
++
++\*---------------------------------------------------------------------------*/
++
++#include "seulexSparseLU.H"
++#include "DynamicList.H"
++
++#include <algorithm>
++
++// * * * * * * * * * * * * * * * * Constructors  * * * * * * * * * * * * * * //
++
++Foam::seulexSparseLU::seulexSparseLU()
++:
++    n_(0),
++    nUpdates_(0)
++{}
++
++
++// * * * * * * * * * * * * * * * Member Functions  * * * * * * * * * * * * * //
++
++void Foam::seulexSparseLU::build(const label n, const boolList& pattern)
++{
++    n_ = n;
++    const scalar maxUpdates = 0.5*scalar(n)*n*n/3;
++
++    label nnz = 0;
++    forAll(pattern, q)
++    {
++        if (pattern[q])
++        {
++            ++nnz;
++        }
++    }
++    if (nnz > 0.5*scalar(n)*n)
++    {
++        nUpdates_ = maxUpdates;
++        rowStart_.clear();
++        col_.clear();
++        diag_.clear();
++        upper_.clear();
++        src_.clear();
++        elimP_.clear();
++        elimPiv_.clear();
++        elimCnt_.clear();
++        updDst_.clear();
++        updSrc_.clear();
++        val_.clear();
++        return;
++    }
++
++    // Symmetrised adjacency of the pattern, without the diagonal
++    List<boolList> adj(n, boolList(n, false));
++    for (label i = 0; i < n; ++i)
++    {
++        for (label j = 0; j < n; ++j)
++        {
++            if (i != j && pattern[i*n + j])
++            {
++                adj[i][j] = true;
++                adj[j][i] = true;
++            }
++        }
++    }
++
++    // Minimum degree ordering (greedy, ties to the lowest index)
++    labelList degree(n, Zero);
++    for (label i = 0; i < n; ++i)
++    {
++        for (label j = 0; j < n; ++j)
++        {
++            if (adj[i][j])
++            {
++                ++degree[i];
++            }
++        }
++    }
++
++    boolList done(n, false);
++    perm_.resize(n);
++    DynamicList<label> nb(n);
++
++    for (label step = 0; step < n; ++step)
++    {
++        label best = -1;
++        for (label i = 0; i < n; ++i)
++        {
++            if (!done[i] && (best < 0 || degree[i] < degree[best]))
++            {
++                best = i;
++            }
++        }
++        perm_[step] = best;
++        done[best] = true;
++
++        // If the minimum degree equals n - 1 - step, the remaining vertices
++        // already form a complete clique and need no further edge updates
++        if (degree[best] == n - 1 - step)
++        {
++            for (label i = 0; i < n; ++i)
++            {
++                if (!done[i])
++                {
++                    perm_[++step] = i;
++                    done[i] = true;
++                }
++            }
++            break;
++        }
++
++        nb.clear();
++        for (label j = 0; j < n; ++j)
++        {
++            if (!done[j] && adj[best][j])
++            {
++                nb.append(j);
++            }
++        }
++
++        // Eliminating best connects all of its remaining neighbours
++        for (const label a : nb)
++        {
++            adj[a][best] = false;
++            --degree[a];
++            if (degree[a] == n - 2 - step)
++            {
++                continue;
++            }
++            for (const label b : nb)
++            {
++                if (a != b && !adj[a][b])
++                {
++                    adj[a][b] = true;
++                    ++degree[a];
++                }
++            }
++        }
++    }
++
++    iperm_.resize(n);
++    forAll(perm_, i)
++    {
++        iperm_[perm_[i]] = i;
++    }
++
++    // Symbolic factorisation, row by row in the new order
++    nUpdates_ = 0;
++
++    List<DynamicList<label>> rows(n);
++    labelList upperStart(n, Zero);
++    boolList mark(n);
++
++    for (label i = 0; i < n; ++i)
++    {
++        mark = false;
++        mark[i] = true;
++        const label oi = perm_[i];
++        for (label j = 0; j < n; ++j)
++        {
++            if (pattern[oi*n + perm_[j]])
++            {
++                mark[j] = true;
++            }
++        }
++        for (label k = 0; k < i; ++k)
++        {
++            if (mark[k])
++            {
++                nUpdates_ += rows[k].size() - upperStart[k];
++                for (label q = upperStart[k]; q < rows[k].size(); ++q)
++                {
++                    mark[rows[k][q]] = true;
++                }
++            }
++        }
++        if (nUpdates_ >= maxUpdates)
++        {
++            rowStart_.clear();
++            col_.clear();
++            diag_.clear();
++            upper_.clear();
++            src_.clear();
++            elimP_.clear();
++            elimPiv_.clear();
++            elimCnt_.clear();
++            updDst_.clear();
++            updSrc_.clear();
++            val_.clear();
++            return;
++        }
++        for (label j = 0; j < n; ++j)
++        {
++            if (mark[j])
++            {
++                rows[i].append(j);
++            }
++        }
++        upperStart[i] = label
++        (
++            std::lower_bound(rows[i].begin(), rows[i].end(), i + 1)
++          - rows[i].begin()
++        );
++    }
++
++    // Flat storage of L+U
++    rowStart_.resize(n + 1);
++    rowStart_[0] = 0;
++    for (label i = 0; i < n; ++i)
++    {
++        rowStart_[i + 1] = rowStart_[i] + rows[i].size();
++    }
++
++    col_.resize(rowStart_[n]);
++    diag_.resize(n);
++    upper_.resize(n);
++    for (label i = 0; i < n; ++i)
++    {
++        forAll(rows[i], q)
++        {
++            col_[rowStart_[i] + q] = rows[i][q];
++        }
++        diag_[i] = rowStart_[i] + label
++        (
++            std::lower_bound(rows[i].begin(), rows[i].end(), i)
++          - rows[i].begin()
++        );
++        upper_[i] = rowStart_[i] + upperStart[i];
++    }
++
++    val_.resize(col_.size());
++    val_ = 0;
++
++    // Where each stored entry comes from in the dense J (-1: fill-in)
++    src_.resize(col_.size());
++    src_ = -1;
++    for (label i = 0; i < n; ++i)
++    {
++        for (label p = rowStart_[i]; p < rowStart_[i + 1]; ++p)
++        {
++            const label d = perm_[i]*n + perm_[col_[p]];
++            if (pattern[d])
++            {
++                src_[p] = d;
++            }
++        }
++    }
++
++    // Elimination program: for row i and each k < i in it,
++    //   l = a_ik/u_kk; a_ik = l; a_ij -= l*u_kj for j in U(k)
++    DynamicList<label> elimP, elimPiv, elimCnt, updDst, updSrc;
++    labelList where(n, -1);
++    nUpdates_ = 0;
++
++    for (label i = 0; i < n; ++i)
++    {
++        for (label p = rowStart_[i]; p < rowStart_[i + 1]; ++p)
++        {
++            where[col_[p]] = p;
++        }
++        for (label p = rowStart_[i]; p < diag_[i]; ++p)
++        {
++            const label k = col_[p];
++            const label cnt = rowStart_[k + 1] - upper_[k];
++            elimP.append(p);
++            elimPiv.append(diag_[k]);
++            elimCnt.append(cnt);
++            for (label q = upper_[k]; q < rowStart_[k + 1]; ++q)
++            {
++                updDst.append(where[col_[q]]);
++                updSrc.append(q);
++            }
++            nUpdates_ += cnt;
++        }
++        for (label p = rowStart_[i]; p < rowStart_[i + 1]; ++p)
++        {
++            where[col_[p]] = -1;
++        }
++    }
++
++    elimP_.transfer(elimP);
++    elimPiv_.transfer(elimPiv);
++    elimCnt_.transfer(elimCnt);
++    updDst_.transfer(updDst);
++    updSrc_.transfer(updSrc);
++
++    scale_.resize(n);
++    work_.resize(n);
++}
++
++
++bool Foam::seulexSparseLU::addEntry(const label d)
++{
++    if (n_ == 0 || col_.empty())
++    {
++        return false;
++    }
++
++    const label i = iperm_[d/n_];
++    const label j = iperm_[d % n_];
++    const label* first = col_.cdata() + rowStart_[i];
++    const label* last = col_.cdata() + rowStart_[i + 1];
++    const label* p = std::lower_bound(first, last, j);
++
++    if (p == last || *p != j)
++    {
++        return false;
++    }
++
++    src_[p - col_.cdata()] = d;
++    return true;
++}
++
++
++// ************************************************************************* //
+diff --git a/src/ODE/ODESolvers/seulex/seulexSparseLU.H b/src/ODE/ODESolvers/seulex/seulexSparseLU.H
+new file mode 100644
+index 0000000..a6b06ad
+--- /dev/null
++++ b/src/ODE/ODESolvers/seulex/seulexSparseLU.H
+@@ -0,0 +1,171 @@
++/*---------------------------------------------------------------------------*\
++  =========                 |
++  \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox
++   \\    /   O peration     |
++    \\  /    A nd           | www.openfoam.com
++     \\/     M anipulation  |
++-------------------------------------------------------------------------------
++    Copyright (C) 2026 OpenFOAM Contributors
++-------------------------------------------------------------------------------
++License
++    This file is part of OpenFOAM.
++
++    OpenFOAM is free software: you can redistribute it and/or modify it
++    under the terms of the GNU General Public License as published by
++    the Free Software Foundation, either version 3 of the License, or
++    (at your option) any later version.
++
++    OpenFOAM is distributed in the hope that it will be useful, but WITHOUT
++    ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++    FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++    for more details.
++
++    You should have received a copy of the GNU General Public License
++    along with OpenFOAM.  If not, see <http://www.gnu.org/licenses/>.
++
++Class
++    Foam::seulexSparseLU
++
++Description
++    LU factorisation of A = r*I - J on a fixed sparsity pattern of the
++    Jacobian J, for the linear systems of seulex.
++
++    The ordering (minimum degree on the symmetrised pattern) and the symbolic
++    factorisation are computed once per pattern; a numeric factorisation is
++    then a flat list of multiply-adds over the non-zeros and the fill-in
++    only. There is no pivoting: factor() returns false when a pivot is tiny
++    against the diagonal it started from (or not finite), and the caller then
++    uses the dense LU with partial pivoting for that matrix.
++
++    For chemistry the Jacobian is very sparse once a mechanism has more than
++    a few dozen species (4 % of the entries are non-zero for a 544-species
++    n-heptane mechanism), so the factorisation costs a small fraction of the
++    dense one.
++
++SourceFiles
++    seulexSparseLU.C
++    seulexSparseLUI.H
++
++\*---------------------------------------------------------------------------*/
++
++#ifndef Foam_seulexSparseLU_H
++#define Foam_seulexSparseLU_H
++
++#include "scalarMatrices.H"
++#include "boolList.H"
++#include "labelList.H"
++#include "scalarList.H"
++
++// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
++
++namespace Foam
++{
++
++/*---------------------------------------------------------------------------*\
++                       Class seulexSparseLU Declaration
++\*---------------------------------------------------------------------------*/
++
++class seulexSparseLU
++{
++    // Private Data
++
++        //- Number of unknowns
++        label n_;
++
++        //- Elimination order: row i of the factors is row perm_[i] of A
++        labelList perm_;
++
++        //- Inverse of perm_
++        labelList iperm_;
++
++        //- Row starts of the stored L+U entries (in the elimination order)
++        labelList rowStart_;
++
++        //- Column of each stored entry (in the elimination order)
++        labelList col_;
++
++        //- Position of the diagonal entry of each row
++        labelList diag_;
++
++        //- Position of the first upper-triangular entry of each row
++        labelList upper_;
++
++        //- Position of each stored entry in the dense J; -1 for fill-in
++        labelList src_;
++
++        //- Elimination program: the eliminated entry, its pivot and the
++        //  number of updates of each elimination ...
++        labelList elimP_;
++        labelList elimPiv_;
++        labelList elimCnt_;
++
++        //- ... and the destinations and sources of all the updates, in order
++        labelList updDst_;
++        labelList updSrc_;
++
++        //- Values of the factors
++        scalarList val_;
++
++        //- Pivot scale of each row: its diagonal before elimination
++        scalarList scale_;
++
++        //- Work space of the solves
++        scalarList work_;
++
++        //- Multiply-adds of one numeric factorisation
++        scalar nUpdates_;
++
++
++public:
++
++    // Constructors
++
++        //- Construct empty; build() sets the pattern
++        seulexSparseLU();
++
++
++    // Member Functions
++
++        //- Compute the ordering and the symbolic factorisation for the
++        //  possible non-zeros of J (n x n flags, row-major)
++        void build(const label n, const boolList& pattern);
++
++        //- Number of unknowns
++        label n() const noexcept
++        {
++            return n_;
++        }
++
++        //- Multiply-adds of one numeric factorisation
++        scalar nUpdates() const noexcept
++        {
++            return nUpdates_;
++        }
++
++        //- Take entry d (row-major in the dense J) into the factorisation
++        //  when the factors already store its position (fill-in); false
++        //  when the pattern has to be rebuilt for it
++        bool addEntry(const label d);
++
++        //- Factorise r*I - J; false if a pivot is too small without
++        //  pivoting (the caller then factorises densely)
++        inline bool factor(const scalarSquareMatrix& J, const scalar r);
++
++        //- Solve A x = b in place with the current factors
++        inline void solve(scalarField& b);
++};
++
++
++// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
++
++} // End namespace Foam
++
++// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
++
++#include "seulexSparseLUI.H"
++
++// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
++
++#endif
++
++// ************************************************************************* //
+diff --git a/src/ODE/ODESolvers/seulex/seulexSparseLUI.H b/src/ODE/ODESolvers/seulex/seulexSparseLUI.H
+new file mode 100644
+index 0000000..9f1d52e
+--- /dev/null
++++ b/src/ODE/ODESolvers/seulex/seulexSparseLUI.H
+@@ -0,0 +1,136 @@
++/*---------------------------------------------------------------------------*\
++  =========                 |
++  \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox
++   \\    /   O peration     |
++    \\  /    A nd           | www.openfoam.com
++     \\/     M anipulation  |
++-------------------------------------------------------------------------------
++    Copyright (C) 2026 OpenFOAM Contributors
++-------------------------------------------------------------------------------
++License
++    This file is part of OpenFOAM.
++
++    OpenFOAM is free software: you can redistribute it and/or modify it
++    under the terms of the GNU General Public License as published by
++    the Free Software Foundation, either version 3 of the License, or
++    (at your option) any later version.
++
++    OpenFOAM is distributed in the hope that it will be useful, but WITHOUT
++    ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++    FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++    for more details.
++
++    You should have received a copy of the GNU General Public License
++    along with OpenFOAM.  If not, see <http://www.gnu.org/licenses/>.
++
++\*---------------------------------------------------------------------------*/
++
++// * * * * * * * * * * * * * * * Member Functions  * * * * * * * * * * * * * //
++
++inline bool Foam::seulexSparseLU::factor
++(
++    const scalarSquareMatrix& J,
++    const scalar r
++)
++{
++    if (col_.empty())
++    {
++        return false;
++    }
++
++    const scalar* Jv = J.cdata();
++    forAll(val_, p)
++    {
++        val_[p] = src_[p] >= 0 ? -Jv[src_[p]] : 0;
++    }
++
++    // Pivot scale: the diagonal before elimination (the rows mix units,
++    // K against kmol/m^3, so a row maximum is no scale)
++    for (label i = 0; i < n_; ++i)
++    {
++        val_[diag_[i]] += r;
++        scale_[i] = mag(val_[diag_[i]]) + mag(r);
++    }
++
++    scalar* v = val_.data();
++    const label* dst = updDst_.cdata();
++    const label* src = updSrc_.cdata();
++
++    forAll(elimP_, e)
++    {
++        const label p = elimP_[e];
++        const label cnt = elimCnt_[e];
++        if (v[p] != 0)
++        {
++            const scalar piv = v[elimPiv_[e]];
++            if (!(mag(piv) > 1e-10*scale_[col_[p]]))
++            {
++                return false;
++            }
++            const scalar l = v[p]/piv;
++            v[p] = l;
++            for (label c = 0; c < cnt; ++c)
++            {
++                v[dst[c]] -= l*v[src[c]];
++            }
++        }
++        dst += cnt;
++        src += cnt;
++    }
++
++    for (label i = 0; i < n_; ++i)
++    {
++        if (!(mag(v[diag_[i]]) > 1e-10*scale_[i]))
++        {
++            return false;
++        }
++    }
++
++    return true;
++}
++
++
++inline void Foam::seulexSparseLU::solve(scalarField& b)
++{
++    scalar* w = work_.data();
++
++    // Forward substitution from the first non-zero entry of the permuted
++    // right-hand side: a leading zero block stays zero
++    label firstNz = n_;
++    for (label i = 0; i < n_; ++i)
++    {
++        w[i] = b[perm_[i]];
++        if (firstNz == n_ && w[i] != 0)
++        {
++            firstNz = i;
++        }
++    }
++    for (label i = firstNz; i < n_; ++i)
++    {
++        scalar s = w[i];
++        for (label p = rowStart_[i]; p < diag_[i]; ++p)
++        {
++            s -= val_[p]*w[col_[p]];
++        }
++        w[i] = s;
++    }
++
++    // Backward substitution
++    for (label i = n_ - 1; i >= 0; --i)
++    {
++        scalar s = w[i];
++        for (label p = upper_[i]; p < rowStart_[i + 1]; ++p)
++        {
++            s -= val_[p]*w[col_[p]];
++        }
++        w[i] = s/val_[diag_[i]];
++    }
++
++    for (label i = 0; i < n_; ++i)
++    {
++        b[perm_[i]] = w[i];
++    }
++}
++
++
++// ************************************************************************* //
+-- 
+2.43.0
+
